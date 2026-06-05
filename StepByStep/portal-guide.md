@@ -20,7 +20,9 @@ Make sure the right accounts are available **before** starting. Some steps need 
 | Step 8a-ii | Create Kerberos server object | **Hybrid Identity Administrator** (Entra) + **Domain Admin** (on-prem) |
 | Steps 9–12 | Check quotas, register providers | **Contributor** or **Owner** on Azure subscription |
 | Steps 13–21 | Create resource groups, VNet, NSG | **Contributor** or **Owner** on Azure subscription |
-| Steps 22–28 | Create storage account, AD-join it, set RBAC | **Contributor** (Azure) + **Domain Admin** (on-prem, for AD join) |
+| Steps 22–23a | Create storage account, file share, private endpoint | **Contributor** or **Owner** on Azure subscription |
+| Step 23b | Configure on-prem DNS conditional forwarder | **DNS Admins** or **Domain Admin** (on-prem) |
+| Steps 24–28 | AD-join storage account, set RBAC, NTFS permissions | **Contributor** (Azure) + **Domain Admin** (on-prem) |
 | Steps 30–42 | Create gallery, deploy and capture build VM | **Contributor** or **Owner** on Azure subscription |
 | Steps 43–47 | Create host pool and session hosts | **Desktop Virtualization Contributor** or **Owner** |
 | Step 47a | Enable SSO RDP property on host pool | **Desktop Virtualization Host Pool Contributor** or higher |
@@ -54,7 +56,7 @@ Make sure the right accounts are available **before** starting. Some steps need 
 ### Step 2 – Create security group for AVD users
 1. In ADUC, navigate to an appropriate OU (e.g. `Users`)
 2. Right-click → **New** → **Group**
-3. Group name: `GRP-AVD-Users`
+3. Group name: `GRP-ContosoGRP-AVD-Users`
 4. Group scope: **Global** | Group type: **Security** → OK
 5. Right-click the new group → **Properties** → **Members** tab → **Add** → add all 25 users
 
@@ -140,35 +142,99 @@ Make sure the right accounts are available **before** starting. Some steps need 
 
 > **Note:** This is a **one-time per Entra tenant** setting — not per host pool or per customer deployment.
 
-#### Step 8a-ii – Create Kerberos Server Object 🖥️
+Hide the consent prompt dialog
+Use dynamic group created before
+In the same PowerShell session, create a targetDeviceGroup object by running the following commands, replacing the <placeholders> with your own values:
+$tdg = New-Object -TypeName Microsoft.Graph.PowerShell.Models.MicrosoftGraphTargetDeviceGroup
+$tdg.Id = "<Group object ID>"
+$tdg.DisplayName = "<Group display name>"
 
-**What it does:** Required for hybrid joined session hosts to complete Kerberos authentication to the on-prem domain controller via SSO.
+Add the group to the targetDeviceGroup object by running the following commands:
+New-MgServicePrincipalRemoteDesktopSecurityConfigurationTargetDeviceGroup -ServicePrincipalId $WCLspId -BodyParameter $tdg
+Output example
+Id                                   DisplayName
+--                                   -----------
+12345678-abcd-1234-abcd-1234567890ab Contoso-session-hosts
 
-**Required roles:**
-- Entra ID: **Hybrid Identity Administrator** (not Global Admin)
-- On-premises: **Domain Admin**
+#### Step 8a-iii – Conditional Access with MFA ☁️
+https://learn.microsoft.com/en-us/azure/virtual-desktop/set-up-mfa?tabs=avd
 
-**Run from:** Domain-joined machine
+**What it does:** Enforces Microsoft Entra multifactor authentication (MFA) when users connect to Azure Virtual Desktop, adding an extra layer of security beyond username and password.
 
-1. Install the module:
-   ```powershell
-   Install-Module -Name AzureADHybridAuthenticationManagement -Force
-   ```
-2. Create the Kerberos server object (prompts for credentials):
-   ```powershell
-   Set-AzureADKerberosServer `
-     -Domain "contoso.local" `
-     -UserPrincipalName "hybridadmin@contoso.com" `
-     -DomainCredential (Get-Credential -Message "Domain Admin credentials for contoso.local")
-   ```
-3. Verify:
-   ```powershell
-   Get-AzureADKerberosServer -Domain "contoso.local" -UserPrincipalName "hybridadmin@contoso.com"
-   ```
-   You should see a `CloudId` value returned.
-4. In ADUC, confirm a computer object named `AzureADKerberos` exists in `CN=Computers`
+**Required role:** **Conditional Access Administrator** (Entra ID)
 
-> **Note:** One per domain — not per host pool.
+**Prerequisites:**
+- Users must have a license that includes **Microsoft Entra ID P1 or P2**
+- Microsoft Entra multifactor authentication must be enabled for your tenant
+- A Microsoft Entra group containing your AVD users (e.g., `GRP-ContosoGRP-AVD-Users`)
+
+**Create Conditional Access Policy:**
+
+1. Sign in to **Microsoft Entra admin center** (https://entra.microsoft.com) as a Conditional Access Administrator
+2. Browse to **Protection** → **Conditional Access** → **Policies**
+3. Select **+ New policy**
+4. Give your policy a name: `AVD - Require MFA`
+
+**Configure Users:**
+
+5. Under **Assignments** → **Users**, select **0 users and groups selected**
+6. Under the **Include** tab, select **Select users and groups** and check **Users and groups**
+7. Under **Select**, select **0 users and groups selected**
+8. Search for and select `GRP-ContosoGRP-AVD-Users` (or your AVD users group) → **Select**
+
+**Configure Target Resources:**
+
+9. Under **Assignments** → **Target resources**, select **No target resources selected**
+10. For **Select what this policy applies to**, leave the default of **Resources (formerly cloud apps)**
+11. Under the **Include** tab, select **Select resources**, then under **Select**, select **None**
+12. On the new pane, search for and select the following apps:
+    - **Azure Virtual Desktop** (app ID `9cdead84-a844-4324-93f2-b2e6bb768d07`) — applies when users subscribe to AVD, authenticate to the AVD Gateway, and send diagnostics
+    - **Windows Cloud Login** (app ID `270efc09-cd0d-444b-a71f-39af4910ec45`) — applies when users authenticate to the session host with SSO enabled
+    
+    > **Important:** Match Conditional Access policies between these two apps, except for sign-in frequency. Do NOT select **Azure Virtual Desktop Azure Resource Manager Provider** (app ID `50e95039-b200-4007-bc97-8d5790743a63`) — this is only for retrieving the user feed.
+
+13. Select **Select**
+
+**Configure Client Apps:**
+
+14. Under **Assignments** → **Conditions**, select **0 conditions selected**
+15. Under **Client apps**, select **Not configured**
+16. On the new pane, for **Configure**, select **Yes**
+17. Select the client apps this policy applies to:
+    - Check **Browser** if you want the policy to apply to the web client
+    - Check **Mobile apps and desktop clients** if you want to apply the policy to other clients
+    - Check **both** if you want to apply the policy to all clients (recommended)
+    - Deselect values for legacy authentication clients
+18. Select **Done**
+
+**Configure Grant Controls:**
+
+19. Under **Access controls** → **Grant**, select **0 controls selected**
+20. On the new pane, select **Grant access**
+21. Check **Require multifactor authentication**
+22. Select **Select**
+
+**Enable Policy:**
+
+23. At the bottom of the page, set **Enable policy** to **On**
+24. Select **Create**
+
+**Optional – Configure Sign-in Frequency:**
+
+To configure how often users must reauthenticate:
+
+25. Open the policy you just created
+26. Under **Access controls** → **Session**, select **0 controls selected**
+27. In the Session pane, select **Sign-in frequency**
+28. Select **Periodic reauthentication** or **Every time**:
+    - **Periodic reauthentication**: Set a time period (e.g., `1` hour) after which users must sign in again when a new access token is needed
+    - **Every time**: Only supported for the **Windows Cloud Login** app with SSO enabled. Users are prompted to reauthenticate when launching a new connection after 5-10 minutes since their last authentication
+29. Select **Select**
+30. At the bottom of the page, select **Save**
+
+> **Note:** Reauthentication only happens when a user must authenticate to a resource and a new access token is needed. After a connection is established, users aren't prompted even if the connection lasts longer than the configured sign-in frequency.
+
+> **Reference:** [Microsoft Learn - Enforce MFA for Azure Virtual Desktop using Conditional Access](https://learn.microsoft.com/en-us/azure/virtual-desktop/set-up-mfa?tabs=avd)
 
 ---
 
@@ -239,11 +305,13 @@ Make sure the right accounts are available **before** starting. Some steps need 
 4. **Security tab:** leave defaults for now (NSG added next)
 5. **Review + Create** → **Create**
 
-> **After creation — set custom DNS (critical for hybrid join):**
+> **After creation — set custom DNS (critical for hybrid join and private endpoints):**
 6. Go to the new VNet → left menu: **DNS servers**
 7. Select **Custom**
 8. Add your on-prem DC IP addresses (e.g. `10.0.0.10`, `10.0.0.11`)
 9. Click **Save**
+
+> **Note:** Custom DNS is required for both domain join and private endpoint DNS resolution. The private DNS zone created in Step 23a will automatically integrate with this VNet to resolve `stacontosoprofiles.file.core.windows.net` to the private IP.
 
 ### Step 17-18 – Create NSG and attach to subnet
 1. Portal → search **Network security groups** → **+ Create**
@@ -315,9 +383,121 @@ Make sure the right accounts are available **before** starting. Some steps need 
 8. Quota: `1024` GB (1 TB — can increase later)
 9. → **Create**
 
+### Step 23a – Configure Private Endpoint for Storage Account ☁️
+
+> Private endpoint ensures FSLogix profile access is only possible from within your VNet, not from the public internet. This is critical for security.
+
+1. Portal → Storage account `stacontosoprofiles` → left menu: **Networking**
+2. Click the **Private endpoint connections** tab → **+ Private endpoint**
+3. **Basics tab:**
+   - Resource group: `rg-contoso-avd-avdresources`
+   - Name: `pe-stacontosoprofiles-file`
+   - Network Interface Name: `nic-pe-stacontosoprofiles-file` *(auto-generated, can leave as is)*
+   - Region: **Denmark East**
+   - → **Next: Resource**
+4. **Resource tab:**
+   - Connection method: **Connect to an Azure resource in my directory**
+   - Subscription: *(your subscription)*
+   - Resource type: `Microsoft.Storage/storageAccounts`
+   - Resource: `stacontosoprofiles`
+   - Target sub-resource: **file**
+   - → **Next: Virtual Network**
+5. **Virtual Network tab:**
+   - Virtual network: `vnet-contoso-dke`
+   - Subnet: `snet-contoso-avd`
+   - Network policy for private endpoints: **Disabled** *(default)*
+   - Private IP configuration: **Dynamically allocate IP address**
+   - Application security group: *(leave empty)*
+   - → **Next: DNS**
+6. **DNS tab:**
+   - Integrate with private DNS zone: **Yes**
+   - Subscription: *(your subscription)*
+   
+   **If the private DNS zone already exists:**
+   - Resource group: *(select the RG where the existing zone is located)*
+   - Private DNS zone: Select **existing** `privatelink.file.core.windows.net` from dropdown
+   
+   **If creating new:**
+   - Resource group: `rg-contoso-avd-avdresources`
+   - Private DNS zone: `privatelink.file.core.windows.net` *(will be auto-created)*
+   
+   - → **Next: Tags**
+   
+   > **Troubleshooting:** If deployment fails with "BadRequest" or "conflict" error about overlapping namespaces:
+   > 1. Cancel this wizard
+   > 2. Go to **Private DNS zones** in the Portal
+   > 3. Find the existing `privatelink.file.core.windows.net` zone
+   > 4. Check **Virtual network links** → verify `vnet-contoso-dke` is linked (if not, add it)
+   > 5. Restart the private endpoint wizard and select the **existing** zone in step 6
+7. **Tags tab:** *(optional)*
+   - Add tags if needed: `Project = AVD`, `Environment = Production`
+   - → **Next: Review + create**
+8. **Review + create** → **Create**
+9. Wait for deployment to complete (1–2 minutes)
+
+**Disable public network access:**
+10. Go back to Storage account → **Networking** → **Firewalls and virtual networks** tab
+11. Public network access: Select **Disabled**
+    - *Alternative:* Select **Enabled from selected virtual networks and IP addresses** if you need temporary access for management from specific IPs
+12. Click **Save**
+
+**Verify private endpoint:**
+13. Storage account → **Networking** → **Private endpoint connections** tab
+14. Confirm the endpoint `pe-stacontosoprofiles-file` shows **Connection state: Approved**
+15. On a domain-joined machine (or session host later), test DNS resolution:
+    ```powershell
+    nslookup stacontosoprofiles.file.core.windows.net
+    ```
+    Should return a **private IP** (10.10.1.x range), not a public IP
+
+> **Important:** After enabling private endpoint and disabling public access, you can only access the file share from within the VNet or via VPN. If you need to run the AD join script (Step 24-26) from your local machine, either run it from a domain-joined VM in Azure, or temporarily allow your public IP in the storage account firewall.
+
+### Step 23b – Configure On-Premises DNS for Private Endpoint Resolution 🖥️
+
+> This step is required for on-premises machines to resolve the storage account's private endpoint via VPN. Without this, on-prem machines will resolve to the public IP (which is now blocked).
+
+**How Private Endpoint DNS Works:**
+- Azure VMs in the VNet automatically use the private DNS zone (`privatelink.file.core.windows.net`) linked to the VNet
+- On-premises DNS servers need a **conditional forwarder** to query Azure's internal DNS resolver
+
+**Configure Conditional Forwarder on On-Premises DNS:**
+
+1. On your **on-premises DNS server**, open **DNS Manager** (`dnsmgmt.msc`)
+2. Expand your DNS server → right-click **Conditional Forwarders** → **New Conditional Forwarder**
+3. DNS Domain: `privatelink.file.core.windows.net`
+4. IP addresses of the master servers: `168.63.129.16`
+   - This is Azure's internal DNS resolver (also called Azure DNS or WireServer)
+   - Click **OK** after entering the IP
+5. Check **Store this conditional forwarder in Active Directory, and replicate it as follows:**
+   - Select: **All DNS servers in this domain** (or **All DNS servers in this forest** if multi-domain)
+6. Click **OK**
+
+**Verify from On-Premises:**
+7. On an on-premises machine connected via VPN, open PowerShell:
+   ```powershell
+   nslookup stacontosoprofiles.file.core.windows.net
+   ```
+   Should return:
+   ```
+   Name:    stacontosoprofiles.privatelink.file.core.windows.net
+   Address: 10.10.1.x  (private IP from your Azure VNet)
+   ```
+
+8. If it still returns a public IP, check:
+   - VPN connection is active and routing to `10.10.0.0/16`
+   - DNS server replication completed (wait 5-10 minutes)
+   - Clear DNS cache: `ipconfig /flushdns`
+
+> **Alternative:** If you cannot modify on-prem DNS servers, run Steps 24-26 and Step 28 from a domain-joined VM in Azure instead of from on-premises.
+
 ### Step 24-26 – Enable AD Authentication on Storage Account 🖥️
 
 > This **must** be done from a domain-joined machine. Cannot be done through the Portal alone.
+
+> **Network access note:** If you disabled public access in Step 23a, run this from:
+> - A domain-joined VM in Azure (same VNet), OR
+> - Your on-prem domain-joined machine via VPN, OR
+> - Temporarily re-enable public access or add your IP to the firewall allowlist
 
 1. On a domain-joined machine, open PowerShell as Administrator
 2. Install the AzFilesHybrid module:
@@ -350,7 +530,7 @@ Make sure the right accounts are available **before** starting. Some steps need 
 2. Left menu: **Access Control (IAM)** → **+ Add** → **Add role assignment**
 3. Role: `Storage File Data SMB Share Contributor`
 4. Assign access to: **User, group, or service principal**
-5. Select: `GRP-AVD-Users` (the AD group you created in Phase 1)
+5. Select: `GRP-ContosoGRP-AVD-Users` (the AD group you created in Phase 1)
 6. → **Review + Assign**
 
 ### Step 28 – Create Entity Subfolders + Set NTFS Permissions 🖥️
@@ -360,42 +540,99 @@ Make sure the right accounts are available **before** starting. Some steps need 
 **Folder layout:**
 ```
 fslogix-profiles\
-  contosogrp\  ← Contoso Group  (GRP-AVD-Users)
+  contosogrp\  ← Contoso Group  (GRP-ContosoGRP-AVD-Users)
   contosode\     ← Contoso Germany          (GRP-ContosoDE-AVD-Users)
 ```
 
-1. On a domain-joined machine, map the share root:
+> **Prerequisites:** This step must be run from a domain-joined machine that has network access to the storage account. Options:
+> - A domain-joined VM in Azure (in the same VNet as the private endpoint)
+> - Your on-premises domain-joined machine connected via VPN
+> - Temporarily allow your public IP in the storage account firewall (Step 23a, step 11)
+
+1. On a domain-joined machine with network access, open **PowerShell as Administrator**
+
+2. Map the share root using AD authentication:
    ```powershell
    net use Z: \\stacontosoprofiles.file.core.windows.net\fslogix-profiles /persistent:no
    ```
-   *(Credentials: username `AZURE\stacontosoprofiles`, password = storage account key from Portal → Access keys)*
+   - When prompted for credentials, use your **domain admin account** (e.g., `CONTOSO\administrator`)
+   - The storage account will authenticate you via AD (configured in Step 24-26)
+   - **Do NOT use** `AZURE\stacontosoprofiles` with storage account key — AD authentication is required for NTFS permissions
 
-**On the share root (Z:\):**
-2. Right-click `Z:` → **Properties** → **Security** → **Advanced**
-3. **Disable inheritance** → Convert to explicit
-4. Keep only `SYSTEM` and `Administrators` (Full Control)
-5. Add each entity AD group with **Traverse folder / execute file** only, **This folder only** (no inheritance)
-   - `GRP-AVD-Users` → Traverse — This folder only
-   - `GRP-ContosoDE-AVD-Users` → Traverse — This folder only
-6. Click **Apply**
+**Create entity subfolders:**
+3. Create the subfolders for each entity:
+   ```powershell
+   New-Item -Path "Z:\contosogrp" -ItemType Directory
+   New-Item -Path "Z:\contosode" -ItemType Directory
+   New-Item -Path "Z:\_redirection" -ItemType Directory
+   ```
 
-**Create and secure the `contosogrp` subfolder:**
-7. Create folder: `Z:\contosogrp`
-8. Right-click `Z:\contosogrp` → **Properties** → **Security** → **Advanced**
-9. **Disable inheritance** → Remove inherited entries
-10. Add `CREATOR OWNER` → **Full Control** → **Subfolders and files only**
-11. Add `GRP-AVD-Users`:
-    - **Traverse folder / execute file** + **List folder** + **Create folders** → **This folder only**
-12. Click **Apply**
+**Configure NTFS permissions for `_redirection` folder (for redirections.xml):**
 
-**Create and secure the `contosode` subfolder:**
-13. Create folder: `Z:\contosode`
-14. Repeat steps 8–12 but use `GRP-ContosoDE-AVD-Users` instead of `GRP-AVD-Users`
+4. Set READ permissions for AVD users to access the redirections.xml file:
+   ```powershell
+   # Grant READ permissions to AVD users with inheritance to files
+   # (OI) = Object Inherit, (CI) = Container Inherit - propagates to files and subfolders
+   icacls Z:\_redirection /grant "CONTOSO\GRP-ContosoGRP-AVD-Users:(OI)(CI)(R)"
+   icacls Z:\_redirection /grant "CONTOSO\GRP-ContosoDE-AVD-Users:(OI)(CI)(R)"
+   
+   # Grant full control to admins with inheritance
+   icacls Z:\_redirection /grant "CONTOSO\Domain Admins:(OI)(CI)(F)"
+   
+   # Remove default permissions
+   icacls Z:\_redirection /remove "Authenticated Users"
+   icacls Z:\_redirection /remove "Builtin\Users"
+   ```
 
-15. Disconnect the mapped drive:
-    ```powershell
-    net use Z: /delete
-    ```
+   > **Note:** Users only need READ access to copy redirections.xml during login. If using SYSVOL instead (recommended for hybrid environments), skip this step and use `\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix` in the GPO setting.
+
+**Configure NTFS permissions for `contosogrp` subfolder:**
+
+5. Set permissions using Microsoft's recommended `icacls` commands:
+   ```powershell
+   # Grant Modify permissions to the AVD users group
+   icacls Z:\contosogrp /grant "CONTOSO\GRP-ContosoGRP-AVD-Users:(M)"
+   
+   # Grant Creator Owner full control over their own profile folders
+   icacls Z:\contosogrp /grant "Creator Owner:(OI)(CI)(IO)(M)"
+   
+   # Remove default permissions
+   icacls Z:\contosogrp /remove "Authenticated Users"
+   icacls Z:\contosogrp /remove "Builtin\Users"
+   ```
+
+**Configure NTFS permissions for `contosode` subfolder:**
+
+6. Repeat for the Germany entity:
+   ```powershell
+   # Grant Modify permissions to the Germany AVD users group
+   icacls Z:\contosode /grant "CONTOSO\GRP-ContosoDE-AVD-Users:(M)"
+   
+   # Grant Creator Owner full control
+   icacls Z:\contosode /grant "Creator Owner:(OI)(CI)(IO)(M)"
+   
+   # Remove default permissions
+   icacls Z:\contosode /remove "Authenticated Users"
+   icacls Z:\contosode /remove "Builtin\Users"
+   ```
+
+**Verify permissions:**
+7. Check the permissions were applied correctly:
+   ```powershell
+   icacls Z:\contosogrp
+   icacls Z:\contosode
+   icacls Z:\_redirection
+   ```
+   - Profile folders should show: `CONTOSO\GRP-Contoso[entity]-AVD-Users:(M)` and `Creator Owner:(OI)(CI)(IO)(M)`
+   - `_redirection` folder should show: Both AVD groups with `(R)` and `Domain Admins:(F)`
+   - No `Authenticated Users` or `Builtin\Users` on any folder
+
+8. Disconnect the mapped drive:
+   ```powershell
+   net use Z: /delete
+   ```
+
+> **Reference:** [Microsoft Learn - Configure FSLogix Profile Container with Azure Files and Active Directory](https://learn.microsoft.com/en-us/fslogix/how-to-configure-profile-container-azure-files-active-directory?tabs=adds)
 
 > **FSLogix VHD Location** for `hp-contosogrp`: `\\stacontosoprofiles.file.core.windows.net\fslogix-profiles\contosogrp`
 > When deploying a new entity (e.g. Contoso Germany), create a new host pool and point its GPO to `...\contosode`
@@ -522,7 +759,7 @@ fslogix-profiles\
 **Virtual Machines tab:**
 10. Add Azure virtual machines: **Yes**
 11. Resource group: `rg-contoso-avd-hosts` *(VMs go into the hosts RG)*
-12. Name prefix: `contosogrp-sh`
+12. Name prefix: `AVD-contoso-sh`
 13. Virtual machine location: **Denmark East**
 14. Availability options: **Availability zone** → select zone `1` for sh-0 *(if available — check first)*
 15. Security type: **Standard**
@@ -621,6 +858,286 @@ fslogix-profiles\
 
 6. Close the GPO editor
 
+> **Note on FSLogix Redirections:** Starting with FSLogix 2210 (2.9.8361.52326) and later, Microsoft Entra ID authentication folders are **automatically excluded** by default and no longer roamed. This includes `Microsoft.AAD.BrokerPlugin`, `Microsoft.Windows.CloudExperienceHost`, and `Microsoft\TokenBroker`. You only need a custom `redirections.xml` file if you have specific application folders to exclude beyond the defaults. For most AVD deployments, the default FSLogix behavior is sufficient.
+>
+> **Reference:** [FSLogix Known Issues - Microsoft Entra ID broker directories](https://learn.microsoft.com/en-us/fslogix/troubleshooting-known-issues#microsoft-entra-id-broker-directories-and-apps)
+
+### Step 55a – (Optional) Configure FSLogix Redirections for Performance 🖥️
+
+> **When to use this:** If you want to optimize profile container performance by excluding browser caches, Teams cache, temp files, and other non-essential data that doesn't need to roam. This reduces VHDX size and improves login/logout times.
+
+> **⚠️ CRITICAL - Read This First:**
+> - Microsoft's official recommendation: **Start WITHOUT redirections.xml** (their "Standard" configuration)
+> - Community consensus: **"Less is best"** - over-excluding causes mysterious application breakages
+> - Real-world experience: Teams starting with 25+ exclusions had constant issues; cutting to ~10 fixed 80% of problems
+> - Each exclusion adds complexity and can cause undocumented application behaviors
+> - **Start with Tier 1 (Minimal), only move to Tier 2/3 if you have proven profile bloat issues**
+
+**Choose Your Tier:**
+
+---
+
+#### **Tier 1: Minimal (Recommended Starting Point)**
+
+**Who this is for:** Most AVD deployments. Proven stable in production for 2+ years.
+
+**What it excludes:** Only Microsoft Teams cache (new MSIX version) and Edge cache - the safest, most impactful exclusions.
+
+**Expected profile size reduction:** 15-25%
+
+1. On a domain-joined machine, create the folder structure:
+   ```powershell
+   New-Item -Path "\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix" -ItemType Directory -Force
+   ```
+
+2. Create `redirections.xml` at `\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix\redirections.xml`:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <FrxProfileFolderRedirection ExcludeCommonFolders="0">
+     <Excludes>
+       <!-- Microsoft Teams (MSIX) cache -->
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\PerfLogs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\Service Worker</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\WebStorage</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\TempState</Exclude>
+       
+       <!-- Legacy Teams (if still present) -->
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\media-stack</Exclude>
+       
+       <!-- Microsoft Edge cache -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\GPUCache</Exclude>
+     </Excludes>
+     <Includes>
+       <!-- Ensure Edge user data is included -->
+       <Include>AppData\Local\Microsoft\Edge\User Data</Include>
+     </Includes>
+   </FrxProfileFolderRedirection>
+   ```
+
+---
+
+#### **Tier 2: Balanced (If Tier 1 Isn't Enough)**
+
+**Who this is for:** Environments with proven profile bloat (>20GB average) after running Tier 1 for 2+ weeks.
+
+**What it adds:** Browser caches (Chrome), system temp files, Office/Zoom logs. Excludes items with **documented Microsoft recommendations** or proven community safety.
+
+**Expected profile size reduction:** 30-40%
+
+**⚠️ Warning:** Test in a pilot group first. Some exclusions (like Code Cache) can hurt warm-load performance.
+
+<details>
+<summary>Click to expand Tier 2 redirections.xml</summary>
+
+2. Create `redirections.xml` at `\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix\redirections.xml`:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <FrxProfileFolderRedirection ExcludeCommonFolders="0">
+     <Excludes>
+       <!-- Microsoft Teams (MSIX) cache -->
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\PerfLogs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\Service Worker</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\TempState</Exclude>
+       
+       <!-- Legacy Teams -->
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\media-stack</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\logs</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\Cache</Exclude>
+       
+       <!-- Google Chrome cache -->
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\Media Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\ShaderCache</Exclude>
+       
+       <!-- Microsoft Edge cache -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Crashpad</Exclude>
+       
+       <!-- Windows system temp -->
+       <Exclude Copy="0">AppData\Local\Temp</Exclude>
+       <Exclude Copy="0">AppData\Local\CrashDumps</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Windows\WER</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Windows\INetCache</Exclude>
+       
+       <!-- Office/Zoom logs -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Office\16.0\Lync\Tracing</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Zoom\logs</Exclude>
+     </Excludes>
+     <Includes>
+       <Include>AppData\Local\Google\Chrome\User Data</Include>
+       <Include>AppData\Local\Microsoft\Edge\User Data</Include>
+     </Includes>
+   </FrxProfileFolderRedirection>
+   ```
+
+</details>
+
+---
+
+#### **Tier 3: Comprehensive (Advanced - Use with Extreme Caution)**
+
+**Who this is for:** Large-scale deployments with severe storage cost issues AND dedicated testing resources.
+
+**What it adds:** Extensive exclusions across all applications, user folders, and system caches.
+
+**Expected profile size reduction:** 40-50%
+
+**⚠️ DANGER:** This list has caused production issues in multiple Reddit-documented cases:
+- Broken Excel add-ins
+- M365 sign-in failures
+- Application state loss
+- Mysterious crashes
+
+**Requirements before using:**
+- ✅ Tier 1 tested for 2+ weeks
+- ✅ Tier 2 tested for 2+ weeks
+- ✅ Dedicated pilot group
+- ✅ Rollback plan ready
+- ✅ User communication prepared
+
+<details>
+<summary>Click to expand Tier 3 redirections.xml (COMPREHENSIVE - TEST THOROUGHLY)</summary>
+
+2. Create `redirections.xml` at `\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix\redirections.xml`:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <FrxProfileFolderRedirection ExcludeCommonFolders="0">
+     <Excludes>
+       <!-- Google Chrome excludes -->
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\Cached Theme Image</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Default\Media Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\ShaderCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\Crashpad</Exclude>
+       <Exclude Copy="0">AppData\Local\Google\Chrome\User Data\SwReporter</Exclude>
+       
+       <!-- Microsoft Edge excludes -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\Cache</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Edge\User Data\Default\Service Worker\CacheStorage</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Default\Code Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Edge\User Data\Crashpad</Exclude>
+       
+       <!-- Microsoft general excludes -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Windows\WER</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Terminal Server Client\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Office\16.0\Lync\Tracing</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\MSOIdentityCRL\Tracing</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\OneNote\16.0\Backup</Exclude>
+       <Exclude Copy="0">AppData\Local\CrashDumps</Exclude>
+       <Exclude Copy="0">AppData\Local\SquirrelTemp</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\TokenBroker\Cache</Exclude>
+       <Exclude Copy="0">AppData\Local\Microsoft\Windows\INetCache</Exclude>
+       
+       <!-- Microsoft Teams excludes -->
+       <Exclude Copy="0">AppData\Local\Microsoft\Teams\Current\Locales</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\PerfLogs</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\GPUCache</Exclude>
+       <Exclude Copy="0">AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\TempState</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\Service Worker\CacheStorage</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\Cache</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft Teams\Logs</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Microsoft\Teams\media-stack</Exclude>
+       
+       <!-- Adobe excludes -->
+       <Exclude Copy="0">AppData\Roaming\Adobe\SLData</Exclude>
+       
+       <!-- Java excludes -->
+       <Exclude Copy="0">AppData\Roaming\Sun\Java\Deployment\cache</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Sun\Java\Deployment\log</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Sun\Java\Deployment\tmp</Exclude>
+       
+       <!-- Mozilla Firefox excludes -->
+       <Exclude Copy="0">AppData\Local\Mozilla Firefox</Exclude>
+       <Exclude Copy="0">AppData\Local\Mozilla</Exclude>
+       
+       <!-- Zoom excludes -->
+       <Exclude Copy="0">AppData\Local\Zoom</Exclude>
+       <Exclude Copy="0">AppData\Roaming\Zoom\logs</Exclude>
+       
+       <!-- Others -->
+       <Exclude Copy="0">AppData\Local\GoToMeeting</Exclude>
+       <Exclude Copy="0">Videos</Exclude>
+       <Exclude Copy="0">Saved Games</Exclude>
+       <Exclude Copy="0">Contacts</Exclude>
+       <Exclude Copy="0">Music</Exclude>
+       <Exclude Copy="0">Downloads</Exclude>
+       <Exclude Copy="0">AppData\Local\Temp</Exclude>
+       <Exclude Copy="0">AppData\Local\VirtualStore</Exclude>
+     </Excludes>
+     <Includes>
+       <Include Copy="3">AppData\LocalLow\Sun\Java\Deployment\security</Include>
+       <Include>AppData\Local\Google\Chrome\User Data</Include>
+       <Include>AppData\Local\Microsoft\Edge\User Data</Include>
+     </Includes>
+   </FrxProfileFolderRedirection>
+   ```
+
+</details>
+
+---
+
+**Additional Notes for All Tiers:**
+
+- **Outlook OST**: Do NOT exclude it. Instead, reduce Outlook's cached exchange mode to 1-2 months (default is 1 year)
+- **New Outlook**: The new Outlook app doesn't use OST files, saving significant space automatically
+
+**Configure GPO to use redirections.xml (applies to all tiers):**
+
+3. Open **Group Policy Management** (`gpmc.msc`)
+4. Edit the `AVD - Session Host Policy` GPO
+5. Navigate to: `Computer Configuration > Policies > Administrative Templates > FSLogix > Profile Containers`
+6. Configure the following setting:
+   - **Redirections XML Source Folder**: **Enabled**
+   - Value: `\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix`
+7. Click **OK** → Close the GPO editor
+
+**Verify:**
+
+8. On a session host, run:
+   ```powershell
+   gpupdate /force
+   Test-Path "\\contoso.local\SYSVOL\contoso.local\Policies\FSLogix\redirections.xml"
+   ```
+   Should return `True`
+
+9. After a user logs in, check if redirections are applied:
+   ```powershell
+   # Check FSLogix logs
+   Get-Content "C:\ProgramData\FSLogix\Logs\Profile\*.log" | Select-String "redirections.xml"
+   ```
+
+**Monitoring Profile Sizes:**
+
+After implementing any tier, monitor profile sizes over 2-4 weeks:
+
+```powershell
+# On the file share server or via Azure Files metrics
+Get-ChildItem "\\stacontosoprofiles.file.core.windows.net\fslogix-profiles\contosogrp\*.vhdx" | 
+  Select-Object Name, @{Name="SizeGB";Expression={[math]::Round($_.Length/1GB,2)}} | 
+  Sort-Object SizeGB -Descending
+```
+
+> **References:**
+> - [Microsoft Learn - FSLogix Redirections Tutorial](https://learn.microsoft.com/en-us/fslogix/tutorial-redirections-xml)
+> - [Microsoft Learn - Configuration Examples](https://learn.microsoft.com/en-us/fslogix/concepts-configuration-examples)
+> - [Reddit FSLogix Community Discussion](https://www.reddit.com/r/fslogix/comments/1r0ccx1/is_there_a_killer_redirectionsxml_for_avd/)
+> - [Aaron Parker's FSLogix Reference](https://github.com/aaronparker/fslogix/blob/main/Redirections/Redirections.csv) (research only, not a recommended implementation)
+
 ### Step 56 – Verify GPO applies
 1. RDP into one of the session hosts (`contosogrp-sh-0`)
 2. Open PowerShell:
@@ -680,7 +1197,7 @@ fslogix-profiles\
    *(Add the 1-2 remaining apps in the same way — confirm paths with customer)*
 
 4. → **Next: Assignments**
-5. Click **+ Add** → search for `GRP-AVD-Users` → select → **Select**
+5. Click **+ Add** → search for `GRP-ContosoGRP-AVD-Users` → select → **Select**
 6. → **Review + Create** → **Create**
 
 ### Step 60-61 – Create Workspace and associate app groups
@@ -694,7 +1211,7 @@ fslogix-profiles\
 ### Step 62-63 – Assign users to app groups
 1. Azure Virtual Desktop → **Application groups** → `ag-contosogrp-apps`
 2. Left menu: **Assignments** → **+ Add**
-3. Search and select `GRP-AVD-Users` → **Select**
+3. Search and select `GRP-ContosoGRP-AVD-Users` → **Select**
 4. Repeat for `ag-contosogrp-desktop` if full desktop access is needed
 
 ---
@@ -757,8 +1274,8 @@ fslogix-profiles\
 ## Phase 10 – Handover Checklist
 
 - [ ] Share the file share UNC path with the customer IT team: `\\stacontosoprofiles.file.core.windows.net\fslogix-profiles`
-- [ ] Document how to add users: add to `GRP-AVD-Users` in Active Directory
-- [ ] Document how to remove users: remove from `GRP-AVD-Users` — their FSLogix `.vhdx` remains on the share
+- [ ] Document how to add users: add to `GRP-ContosoGRP-AVD-Users` in Active Directory
+- [ ] Document how to remove users: remove from `GRP-ContosoGRP-AVD-Users` — their FSLogix `.vhdx` remains on the share
 - [ ] Share the App Store link for Windows App (Mac + Windows)
 - [ ] Keep Citrix running in parallel for **2–4 weeks** before decommissioning
 - [ ] After parallel period: schedule Citrix decommission with customer
@@ -849,5 +1366,5 @@ Total RAM needed = (concurrent users × RAM per user) + 3 GB OS overhead
 | Hybrid join not showing in Entra ID | Device writeback off / OU not in sync scope | Check Entra Connect config, re-run `Start-ADSyncSyncCycle` |
 | Users get temporary profile (not FSLogix) | NTFS permissions wrong or share unreachable | Check permissions on share, verify storage account AD auth |
 | Can't resolve on-prem domain from session host | VNet DNS still set to Azure default | Check VNet DNS servers → must point to on-prem DC |
-| App not visible in workspace | User not assigned to app group | AVD → App group → Assignments → add `GRP-AVD-Users` |
+| App not visible in workspace | User not assigned to app group | AVD → App group → Assignments → add `GRP-ContosoGRP-AVD-Users` |
 | BC not connecting to on-prem server | VPN routing / firewall | Check NSG, check that BC port (typically 7046/443) is open over VPN |
